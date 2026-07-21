@@ -28,8 +28,14 @@ import {
 } from "recharts";
 
 import { STOCKS } from "@/lib/symbols";
-import type { BbEmaResult, Timeframe } from "@/lib/types";
-import { SCREENERS } from "@/lib/types";
+import type {
+  ScanResult as BaseScanResult,
+  Timeframe,
+  Strategy,
+  BbScreenerConfig,
+  RsiScreenerConfig,
+} from "@/lib/types";
+import { SCREENERS, modeId, STRATEGY_META } from "@/lib/types";
 import {
   formatINR,
   formatPercent,
@@ -38,12 +44,13 @@ import {
   statusLabel,
 } from "@/lib/utils";
 
-type ScanResult = BbEmaResult & { scannedAt: string };
+type ScanResult = BaseScanResult & { scannedAt: string };
 type SignalFilter = "ALL" | "BUY" | "EXIT" | "IN_LONG" | "FLAT" | "SIGNALS";
 
 const CONCURRENCY = 6;
 
-export default function BbEmaScanner() {
+export default function MultiScanner() {
+  const [strategy, setStrategy] = useState<Strategy>("bb");
   const [timeframe, setTimeframe] = useState<Timeframe>("weekly");
   const [isScanning, setIsScanning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -58,8 +65,18 @@ export default function BbEmaScanner() {
   });
   const [selectedStock, setSelectedStock] = useState<ScanResult | null>(null);
 
-  const cfg = SCREENERS[timeframe];
+  const activeModeId = modeId(strategy, timeframe);
+  const cfg = SCREENERS[activeModeId];
+  const isBb = strategy === "bb";
+  const isRsi = !isBb;
   const universeSize = STOCKS.length;
+
+  const resetScanState = () => {
+    setResults([]);
+    setLastScan(null);
+    setSignalFilter("SIGNALS");
+    setSelectedStock(null);
+  };
 
   const counts = useMemo(() => {
     return {
@@ -134,13 +151,17 @@ export default function BbEmaScanner() {
           valA = a.pctVsEma ?? -9999;
           valB = b.pctVsEma ?? -9999;
           break;
+        case "rsi":
+          valA = a.rsi ?? -9999;
+          valB = b.rsi ?? -9999;
+          break;
         case "symbol":
           valA = a.symbol;
           valB = b.symbol;
           break;
         case "ema":
-          valA = a.ema ?? -9999;
-          valB = b.ema ?? -9999;
+          valA = a.ema ?? a.ema21 ?? -9999;
+          valB = b.ema ?? b.ema21 ?? -9999;
           break;
         default: {
           const anyA = a as unknown as Record<string, number | string>;
@@ -173,8 +194,9 @@ export default function BbEmaScanner() {
     setProgress({ done: 0, total: STOCKS.length });
     setSelectedStock(null);
 
-    const tf = timeframe;
-    toast.info(`Scanning ${STOCKS.length} NSE stocks · ${SCREENERS[tf].label}`);
+    const mid = modeId(strategy, timeframe);
+    const label = SCREENERS[mid].label;
+    toast.info(`Scanning ${STOCKS.length} NSE stocks · ${label}`);
 
     let done = 0;
     const scanned = await runWithConcurrency(STOCKS, CONCURRENCY, async (sym) => {
@@ -182,14 +204,19 @@ export default function BbEmaScanner() {
         const res = await fetch("/api/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: sym, timeframe: tf }),
+          body: JSON.stringify({
+            symbol: sym,
+            strategy,
+            timeframe,
+            modeId: mid,
+          }),
         });
         if (!res.ok) {
           done++;
           setProgress({ done, total: STOCKS.length });
           return null;
         }
-        const data: BbEmaResult = await res.json();
+        const data: BaseScanResult = await res.json();
         done++;
         setProgress({ done, total: STOCKS.length });
 
@@ -216,7 +243,7 @@ export default function BbEmaScanner() {
     toast.success(
       `Scan complete · ${scanned.length} stocks · ${buys} BUY · ${exits} EXIT`
     );
-  }, [isScanning, timeframe]);
+  }, [isScanning, strategy, timeframe]);
 
   const exportCsv = () => {
     if (!filteredResults.length) {
@@ -226,12 +253,15 @@ export default function BbEmaScanner() {
     const headers = [
       "Symbol",
       "Name",
+      "Strategy",
       "Timeframe",
       "Status",
       "LTP",
       "Change%",
       "LastClose",
       "EMA",
+      "EMA21",
+      "RSI",
       "BB_Basis",
       "BB_Upper",
       "BB_Lower",
@@ -246,12 +276,15 @@ export default function BbEmaScanner() {
       [
         r.symbol,
         `"${r.name.replace(/"/g, '""')}"`,
+        r.strategy,
         r.timeframe,
         r.status,
         r.ltp,
         r.changePct,
         r.lastClose,
         r.ema ?? "",
+        r.ema21 ?? "",
+        r.rsi ?? "",
         r.bbBasis ?? "",
         r.bbUpper ?? "",
         r.bbLower ?? "",
@@ -269,7 +302,7 @@ export default function BbEmaScanner() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `bb-ema-${timeframe}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `scanner-${activeModeId}-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
     toast.success("CSV exported");
@@ -278,13 +311,28 @@ export default function BbEmaScanner() {
   // Chart data for selected stock
   const chartData = useMemo(() => {
     if (!selectedStock?.recentCandles?.length) return [];
-    const closes = selectedStock.recentCandles.map((c) => c.close);
-    // Recompute bands for chart display using same params
-    const bbLen = cfg.bbLength;
-    const bbMult = cfg.bbMult;
-    const emaLen = cfg.emaLen;
 
-    // Lightweight recompute for display only
+    // RSI chart: plot RSI history with levels
+    if (selectedStock.kind === "rsi" && selectedStock.rsiHistory?.length) {
+      return selectedStock.rsiHistory.map((h) => ({
+        date: h.date.slice(5),
+        rsi: h.rsi ?? undefined,
+        level70: 70,
+        level55: 55,
+        level30: 30,
+        level10: 10,
+        level90: 90,
+      }));
+    }
+
+    // BB chart
+    if (cfg.strategy !== "bb") return [];
+    const bbCfg = cfg as BbScreenerConfig;
+    const closes = selectedStock.recentCandles.map((c) => c.close);
+    const bbLen = bbCfg.bbLength;
+    const bbMult = bbCfg.bbMult;
+    const emaLen = bbCfg.emaLen;
+
     const emaArr: (number | null)[] = [];
     const k = 2 / (emaLen + 1);
     let ema = NaN;
@@ -317,7 +365,6 @@ export default function BbEmaScanner() {
         basisArr.push(null);
         continue;
       }
-      // Use EMA window for BB
       const window: number[] = [];
       for (let j = i - bbLen + 1; j <= i; j++) {
         if (emaArr[j] != null) window.push(emaArr[j]!);
@@ -338,7 +385,7 @@ export default function BbEmaScanner() {
     }
 
     return selectedStock.recentCandles.map((c, i) => ({
-      date: c.date.slice(5), // MM-DD
+      date: c.date.slice(5),
       close: c.close,
       ema: emaArr[i] != null ? Number(emaArr[i]!.toFixed(2)) : undefined,
       upper: upperArr[i] != null ? Number(upperArr[i]!.toFixed(2)) : undefined,
@@ -359,15 +406,41 @@ export default function BbEmaScanner() {
               </div>
               <div>
                 <h1 className="text-xl font-semibold tracking-tight text-white sm:text-2xl">
-                  BB(on EMA) · NSE Screener
+                  NSE Multi-Screener
                 </h1>
                 <p className="mt-0.5 text-sm text-[#8b95a8]">
-                  PineScript buy-only logic · Indian stocks via Yahoo Finance
+                  BB(on EMA) + RSI · Indian stocks via Yahoo Finance
                 </p>
               </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {/* Strategy toggle */}
+              <div className="flex rounded-xl border border-[#1c2433] bg-[#0d111a] p-1">
+                {(["bb", "rsi70", "rsi10"] as Strategy[]).map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    disabled={isScanning}
+                    onClick={() => {
+                      setStrategy(s);
+                      resetScanState();
+                    }}
+                    className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition sm:px-3 sm:text-sm ${
+                      strategy === s
+                        ? s === "bb"
+                          ? "bg-blue-600 text-white shadow"
+                          : s === "rsi70"
+                            ? "bg-violet-600 text-white shadow"
+                            : "bg-amber-600 text-white shadow"
+                        : "text-[#8b95a8] hover:text-white"
+                    } disabled:opacity-50`}
+                  >
+                    {STRATEGY_META[s].short}
+                  </button>
+                ))}
+              </div>
+
               {/* Timeframe toggle */}
               <div className="flex rounded-xl border border-[#1c2433] bg-[#0d111a] p-1">
                 {(["weekly", "daily"] as Timeframe[]).map((tf) => (
@@ -377,13 +450,11 @@ export default function BbEmaScanner() {
                     disabled={isScanning}
                     onClick={() => {
                       setTimeframe(tf);
-                      setResults([]);
-                      setLastScan(null);
-                      setSignalFilter("SIGNALS");
+                      resetScanState();
                     }}
                     className={`rounded-lg px-3.5 py-1.5 text-sm font-medium transition ${
                       timeframe === tf
-                        ? "bg-blue-600 text-white shadow"
+                        ? "bg-slate-600 text-white shadow"
                         : "text-[#8b95a8] hover:text-white"
                     } disabled:opacity-50`}
                   >
@@ -424,14 +495,34 @@ export default function BbEmaScanner() {
               <Target className="h-3 w-3 text-blue-400" />
               {cfg.label}
             </span>
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
-              <BarChart3 className="h-3 w-3 text-orange-400" />
-              EMA({cfg.emaLen}) → BB({cfg.bbLength}, {cfg.bbMult})
-            </span>
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
-              <Activity className="h-3 w-3 text-lime-400" />
-              Entry: close &gt; upper &amp; close &gt; EMA
-            </span>
+            {isBb ? (
+              <>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
+                  <BarChart3 className="h-3 w-3 text-orange-400" />
+                  EMA({(cfg as BbScreenerConfig).emaLen}) → BB(
+                  {(cfg as BbScreenerConfig).bbLength},{" "}
+                  {(cfg as BbScreenerConfig).bbMult})
+                </span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
+                  <Activity className="h-3 w-3 text-lime-400" />
+                  Entry: close &gt; upper &amp; EMA
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
+                  <BarChart3 className="h-3 w-3 text-violet-400" />
+                  RSI({(cfg as RsiScreenerConfig).rsiLength}) on EMA(
+                  {(cfg as RsiScreenerConfig).sourceEmaLen})
+                </span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
+                  <Activity className="h-3 w-3 text-lime-400" />
+                  {strategy === "rsi70"
+                    ? "BUY: fresh cross ↑70 · EXIT: ↑90 or ↓55"
+                    : "BUY: fresh cross ↑10 · EXIT: ↓10"}
+                </span>
+              </>
+            )}
             <span className="inline-flex items-center gap-1.5 rounded-full border border-[#1c2433] bg-[#0d111a] px-2.5 py-1">
               Universe: {universeSize} NSE
             </span>
@@ -576,32 +667,45 @@ export default function BbEmaScanner() {
                   >
                     Chg %
                   </Th>
-                  <Th onClick={() => toggleSort("ema")} active={sortConfig.key === "ema"} align="right">
-                    EMA
-                  </Th>
-                  <th className="px-3 py-3 font-medium text-right">BB Upper</th>
-                  <th className="px-3 py-3 font-medium text-right">BB Lower</th>
-                  <Th
-                    onClick={() => toggleSort("pctAboveUpper")}
-                    active={sortConfig.key === "pctAboveUpper"}
-                    align="right"
-                  >
-                    vs Upper
-                  </Th>
-                  <Th
-                    onClick={() => toggleSort("pctVsEma")}
-                    active={sortConfig.key === "pctVsEma"}
-                    align="right"
-                  >
-                    vs EMA
-                  </Th>
+                  {isBb ? (
+                    <>
+                      <Th onClick={() => toggleSort("ema")} active={sortConfig.key === "ema"} align="right">
+                        EMA
+                      </Th>
+                      <th className="px-3 py-3 font-medium text-right">BB Upper</th>
+                      <th className="px-3 py-3 font-medium text-right">BB Lower</th>
+                      <Th
+                        onClick={() => toggleSort("pctAboveUpper")}
+                        active={sortConfig.key === "pctAboveUpper"}
+                        align="right"
+                      >
+                        vs Upper
+                      </Th>
+                      <Th
+                        onClick={() => toggleSort("pctVsEma")}
+                        active={sortConfig.key === "pctVsEma"}
+                        align="right"
+                      >
+                        vs EMA
+                      </Th>
+                    </>
+                  ) : (
+                    <>
+                      <Th onClick={() => toggleSort("rsi")} active={sortConfig.key === "rsi"} align="right">
+                        RSI
+                      </Th>
+                      <th className="px-3 py-3 font-medium text-right">Prev RSI</th>
+                      <th className="px-3 py-3 font-medium text-right">EMA(21)</th>
+                      <th className="px-3 py-3 font-medium text-right">Δ RSI</th>
+                    </>
+                  )}
                   <th className="px-3 py-3 font-medium">Date</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredResults.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="px-4 py-16 text-center text-[#8b95a8]">
+                    <td colSpan={isBb ? 10 : 9} className="px-4 py-16 text-center text-[#8b95a8]">
                       {isScanning ? (
                         <span className="inline-flex items-center gap-2">
                           <RefreshCw className="h-4 w-4 animate-spin" />
@@ -611,11 +715,7 @@ export default function BbEmaScanner() {
                         <div className="space-y-2">
                           <TrendingUp className="mx-auto h-8 w-8 opacity-40" />
                           <p>Hit <strong className="text-white">Run Scan</strong> to screen NSE stocks</p>
-                          <p className="text-xs">
-                            {timeframe === "weekly"
-                              ? "Weekly BB(50, 2) on EMA(2)"
-                              : "Daily BB(50, 0.7) on EMA(20)"}
-                          </p>
+                          <p className="text-xs">{cfg.label}</p>
                         </div>
                       ) : (
                         "No rows match current filters"
@@ -656,29 +756,66 @@ export default function BbEmaScanner() {
                       >
                         {formatPercent(r.changePct)}
                       </td>
-                      <td className="px-3 py-2.5 text-right font-mono text-orange-300/90">
-                        {r.ema != null ? r.ema.toFixed(2) : "—"}
-                      </td>
-                      <td className="px-3 py-2.5 text-right font-mono text-green-400/80">
-                        {r.bbUpper != null ? r.bbUpper.toFixed(2) : "—"}
-                      </td>
-                      <td className="px-3 py-2.5 text-right font-mono text-red-400/80">
-                        {r.bbLower != null ? r.bbLower.toFixed(2) : "—"}
-                      </td>
-                      <td
-                        className={`px-3 py-2.5 text-right font-mono ${
-                          (r.pctAboveUpper ?? 0) > 0 ? "text-lime-400" : "text-[#8b95a8]"
-                        }`}
-                      >
-                        {formatPercent(r.pctAboveUpper)}
-                      </td>
-                      <td
-                        className={`px-3 py-2.5 text-right font-mono ${
-                          (r.pctVsEma ?? 0) > 0 ? "text-cyan-400" : "text-[#8b95a8]"
-                        }`}
-                      >
-                        {formatPercent(r.pctVsEma)}
-                      </td>
+                      {isBb ? (
+                        <>
+                          <td className="px-3 py-2.5 text-right font-mono text-orange-300/90">
+                            {r.ema != null ? r.ema.toFixed(2) : "—"}
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-mono text-green-400/80">
+                            {r.bbUpper != null ? r.bbUpper.toFixed(2) : "—"}
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-mono text-red-400/80">
+                            {r.bbLower != null ? r.bbLower.toFixed(2) : "—"}
+                          </td>
+                          <td
+                            className={`px-3 py-2.5 text-right font-mono ${
+                              (r.pctAboveUpper ?? 0) > 0 ? "text-lime-400" : "text-[#8b95a8]"
+                            }`}
+                          >
+                            {formatPercent(r.pctAboveUpper)}
+                          </td>
+                          <td
+                            className={`px-3 py-2.5 text-right font-mono ${
+                              (r.pctVsEma ?? 0) > 0 ? "text-cyan-400" : "text-[#8b95a8]"
+                            }`}
+                          >
+                            {formatPercent(r.pctVsEma)}
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td
+                            className={`px-3 py-2.5 text-right font-mono font-semibold ${
+                              (r.rsi ?? 0) >= 70
+                                ? "text-lime-400"
+                                : (r.rsi ?? 0) <= 30
+                                  ? "text-red-400"
+                                  : "text-violet-300"
+                            }`}
+                          >
+                            {r.rsi != null ? r.rsi.toFixed(1) : "—"}
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-mono text-[#8b95a8]">
+                            {r.prevRsi != null ? r.prevRsi.toFixed(1) : "—"}
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-mono text-orange-300/90">
+                            {r.ema21 != null ? r.ema21.toFixed(2) : "—"}
+                          </td>
+                          <td
+                            className={`px-3 py-2.5 text-right font-mono ${
+                              r.rsi != null && r.prevRsi != null
+                                ? r.rsi - r.prevRsi > 0
+                                  ? "text-lime-400"
+                                  : "text-red-400"
+                                : "text-[#8b95a8]"
+                            }`}
+                          >
+                            {r.rsi != null && r.prevRsi != null
+                              ? `${r.rsi - r.prevRsi > 0 ? "+" : ""}${(r.rsi - r.prevRsi).toFixed(1)}`
+                              : "—"}
+                          </td>
+                        </>
+                      )}
                       <td className="px-3 py-2.5 text-xs text-[#8b95a8]">{r.lastDate}</td>
                     </tr>
                   ))
@@ -696,30 +833,66 @@ export default function BbEmaScanner() {
         {/* Logic reference */}
         <div className="mt-8 rounded-2xl border border-[#1c2433] bg-[#0d111a]/60 p-5 text-sm text-[#8b95a8]">
           <h2 className="mb-2 font-medium text-white">Signal logic (from PineScript)</h2>
-          <ul className="list-inside list-disc space-y-1 text-xs sm:text-sm">
-            <li>
-              <code className="text-orange-300">EMA</code> on close · length{" "}
-              <strong className="text-white">{cfg.emaLen}</strong>
-            </li>
-            <li>
-              Bollinger Bands computed on the <strong className="text-white">EMA series</strong>{" "}
-              (not raw close): SMA({cfg.bbLength}) ± {cfg.bbMult} × StdDev({cfg.bbLength})
-            </li>
-            <li>
-              <span className="text-lime-400 font-medium">BUY</span>: close &gt; upper BB{" "}
-              <em>and</em> close &gt; EMA · one-shot (fires once until exit)
-            </li>
-            <li>
-              <span className="text-fuchsia-400 font-medium">EXIT</span>: close &lt; lower BB ·
-              resets long state
-            </li>
-            <li>
-              Timeframe:{" "}
-              <strong className="text-white">
-                {timeframe === "weekly" ? "weekly candle close" : "daily candle close"}
-              </strong>
-            </li>
-          </ul>
+          {isBb ? (
+            <ul className="list-inside list-disc space-y-1 text-xs sm:text-sm">
+              <li>
+                <code className="text-orange-300">EMA</code> on close · length{" "}
+                <strong className="text-white">{(cfg as BbScreenerConfig).emaLen}</strong>
+              </li>
+              <li>
+                Bollinger Bands on the <strong className="text-white">EMA series</strong>: SMA(
+                {(cfg as BbScreenerConfig).bbLength}) ± {(cfg as BbScreenerConfig).bbMult} × StdDev
+              </li>
+              <li>
+                <span className="text-lime-400 font-medium">BUY</span>: close &gt; upper BB{" "}
+                <em>and</em> close &gt; EMA · one-shot
+              </li>
+              <li>
+                <span className="text-fuchsia-400 font-medium">EXIT</span>: close &lt; lower BB
+              </li>
+            </ul>
+          ) : (
+            <ul className="list-inside list-disc space-y-1 text-xs sm:text-sm">
+              <li>
+                RSI <strong className="text-white">source</strong> ={" "}
+                <code className="text-orange-300">EMA(close, 21)</code> (not raw close)
+              </li>
+              <li>
+                RSI length = <strong className="text-white">10</strong> · Wilder RMA of gains/losses
+              </li>
+              {strategy === "rsi70" ? (
+                <>
+                  <li>
+                    <span className="text-lime-400 font-medium">BUY</span>: fresh RSI cross{" "}
+                    <strong className="text-white">above 70</strong>
+                  </li>
+                  <li>
+                    <span className="text-fuchsia-400 font-medium">EXIT</span>: fresh cross{" "}
+                    <strong className="text-white">above 90</strong> or falls{" "}
+                    <strong className="text-white">below 55</strong>
+                  </li>
+                </>
+              ) : (
+                <>
+                  <li>
+                    <span className="text-lime-400 font-medium">BUY</span>: fresh RSI cross{" "}
+                    <strong className="text-white">above 10</strong> (recovery)
+                  </li>
+                  <li>
+                    <span className="text-fuchsia-400 font-medium">EXIT</span>: fresh cross back{" "}
+                    <strong className="text-white">below 10</strong>
+                  </li>
+                </>
+              )}
+              <li>All signals are <strong className="text-white">fresh crosses only</strong> (one-shot)</li>
+            </ul>
+          )}
+          <p className="mt-2 text-xs">
+            Timeframe:{" "}
+            <strong className="text-white">
+              {timeframe === "weekly" ? "weekly candle close" : "daily candle close"}
+            </strong>
+          </p>
         </div>
       </main>
 
@@ -776,44 +949,72 @@ export default function BbEmaScanner() {
                         : undefined
                   }
                 />
-                <Stat
-                  label={`EMA(${cfg.emaLen})`}
-                  value={selectedStock.ema?.toFixed(2) ?? "—"}
-                  color="text-orange-300"
-                />
-                <Stat
-                  label="Last bar"
-                  value={selectedStock.lastDate}
-                />
-                <Stat
-                  label="BB Upper"
-                  value={selectedStock.bbUpper?.toFixed(2) ?? "—"}
-                  color="text-green-400"
-                />
-                <Stat
-                  label="BB Basis"
-                  value={selectedStock.bbBasis?.toFixed(2) ?? "—"}
-                  color="text-blue-400"
-                />
-                <Stat
-                  label="BB Lower"
-                  value={selectedStock.bbLower?.toFixed(2) ?? "—"}
-                  color="text-red-400"
-                />
-                <Stat
-                  label="Close"
-                  value={selectedStock.lastClose.toFixed(2)}
-                />
+                {selectedStock.kind === "rsi" ? (
+                  <>
+                    <Stat
+                      label="RSI"
+                      value={selectedStock.rsi?.toFixed(2) ?? "—"}
+                      color="text-violet-300"
+                    />
+                    <Stat
+                      label="Prev RSI"
+                      value={selectedStock.prevRsi?.toFixed(2) ?? "—"}
+                    />
+                    <Stat
+                      label="EMA(21) src"
+                      value={selectedStock.ema21?.toFixed(2) ?? "—"}
+                      color="text-orange-300"
+                    />
+                    <Stat label="Last bar" value={selectedStock.lastDate} />
+                    <Stat label="Close" value={selectedStock.lastClose.toFixed(2)} />
+                    <Stat
+                      label="Mode"
+                      value={
+                        selectedStock.strategy === "rsi70" ? "Cross 70" : "Cross 10"
+                      }
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Stat
+                      label={`EMA(${(cfg as BbScreenerConfig).emaLen})`}
+                      value={selectedStock.ema?.toFixed(2) ?? "—"}
+                      color="text-orange-300"
+                    />
+                    <Stat label="Last bar" value={selectedStock.lastDate} />
+                    <Stat
+                      label="BB Upper"
+                      value={selectedStock.bbUpper?.toFixed(2) ?? "—"}
+                      color="text-green-400"
+                    />
+                    <Stat
+                      label="BB Basis"
+                      value={selectedStock.bbBasis?.toFixed(2) ?? "—"}
+                      color="text-blue-400"
+                    />
+                    <Stat
+                      label="BB Lower"
+                      value={selectedStock.bbLower?.toFixed(2) ?? "—"}
+                      color="text-red-400"
+                    />
+                    <Stat
+                      label="Close"
+                      value={selectedStock.lastClose.toFixed(2)}
+                    />
+                  </>
+                )}
               </div>
 
               {chartData.length > 0 && (
                 <div className="px-5 pb-2">
                   <p className="mb-2 text-xs text-[#8b95a8]">
-                    Price · EMA · BB (on EMA) · last {chartData.length} bars
+                    {selectedStock.kind === "rsi"
+                      ? `RSI(10 on EMA21) · last ${chartData.length} bars`
+                      : `Price · EMA · BB (on EMA) · last ${chartData.length} bars`}
                   </p>
                   <div className="h-64 w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={chartData}>
+                      <LineChart data={chartData as Record<string, string | number | undefined>[]}>
                         <CartesianGrid stroke="#1c2433" strokeDasharray="3 3" />
                         <XAxis
                           dataKey="date"
@@ -821,7 +1022,9 @@ export default function BbEmaScanner() {
                           interval="preserveStartEnd"
                         />
                         <YAxis
-                          domain={["auto", "auto"]}
+                          domain={
+                            selectedStock.kind === "rsi" ? [0, 100] : ["auto", "auto"]
+                          }
                           tick={{ fill: "#8b95a8", fontSize: 10 }}
                           width={56}
                         />
@@ -833,54 +1036,66 @@ export default function BbEmaScanner() {
                             fontSize: 12,
                           }}
                         />
-                        <Line
-                          type="monotone"
-                          dataKey="upper"
-                          stroke="#22c55e"
-                          dot={false}
-                          strokeWidth={1}
-                          name="Upper"
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="lower"
-                          stroke="#ef4444"
-                          dot={false}
-                          strokeWidth={1}
-                          name="Lower"
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="basis"
-                          stroke="#3b82f6"
-                          dot={false}
-                          strokeWidth={1}
-                          strokeDasharray="4 2"
-                          name="Basis"
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="ema"
-                          stroke="#f97316"
-                          dot={false}
-                          strokeWidth={1.5}
-                          name="EMA"
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="close"
-                          stroke="#e2e8f0"
-                          dot={false}
-                          strokeWidth={2}
-                          name="Close"
-                        />
-                        {selectedStock.ltp > 0 && (
-                          <ReferenceLine
-                            y={selectedStock.ltp}
-                            stroke="#84cc16"
-                            strokeDasharray="3 3"
-                            strokeOpacity={0.5}
-                          />
+                        {selectedStock.kind === "rsi" ? (
+                          <>
+                            <ReferenceLine y={70} stroke="#84cc16" strokeDasharray="3 3" />
+                            <ReferenceLine y={55} stroke="#f59e0b" strokeDasharray="3 3" />
+                            <ReferenceLine y={30} stroke="#ef4444" strokeDasharray="3 3" />
+                            <ReferenceLine y={10} stroke="#f472b6" strokeDasharray="3 3" />
+                            <ReferenceLine y={90} stroke="#22c55e" strokeDasharray="2 2" />
+                            <Line
+                              type="monotone"
+                              dataKey="rsi"
+                              stroke="#a78bfa"
+                              dot={false}
+                              strokeWidth={2}
+                              name="RSI"
+                            />
+                          </>
+                        ) : (
+                          <>
+                            <Line
+                              type="monotone"
+                              dataKey="upper"
+                              stroke="#22c55e"
+                              dot={false}
+                              strokeWidth={1}
+                              name="Upper"
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="lower"
+                              stroke="#ef4444"
+                              dot={false}
+                              strokeWidth={1}
+                              name="Lower"
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="basis"
+                              stroke="#3b82f6"
+                              dot={false}
+                              strokeWidth={1}
+                              strokeDasharray="4 2"
+                              name="Basis"
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="ema"
+                              stroke="#f97316"
+                              dot={false}
+                              strokeWidth={1.5}
+                              name="EMA"
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="close"
+                              stroke="#e2e8f0"
+                              dot={false}
+                              strokeWidth={2}
+                              name="Close"
+                            />
+                          </>
                         )}
                       </LineChart>
                     </ResponsiveContainer>
