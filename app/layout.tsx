@@ -14,9 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "BB(on EMA) NSE Screener | Weekly + Daily",
+  title: "NSE Multi-Screener | BB + RSI",
   description:
-    "Indian stocks screener: Bollinger Bands on EMA buy-only scanner. Weekly BB(50,2)+EMA(2) and Daily BB(50,0.7)+EMA(20).",
+    "Indian stocks: BB(on EMA) and RSI(10 on EMA21) scanners — weekly & daily. Fresh buy/exit signals.",
 };
 
 export default function RootLayout({
