@@ -1,32 +1,35 @@
-# BB(on EMA) NSE Screener
+# NSE Multi-Screener (BB + RSI)
 
-Next.js screener that ports the TradingView PineScript indicator **BB(on EMA) + EMA Buy-Only Scanner** to Indian (NSE) stocks.
+Next.js app for Indian (NSE) stocks with **six** screeners in one UI.
 
 ## Screeners
 
-| Mode | Timeframe | BB Length | BB Mult | EMA Length |
-|------|-----------|-----------|---------|------------|
-| **Weekly** | Weekly candle close | 50 | 2.0 | 2 |
-| **Daily** | Daily candle close | 50 | 0.7 | 20 |
+### BB(on EMA)
 
-## Signal logic (matches Pine)
+| Mode | Timeframe | BB | EMA |
+|------|-----------|-----|-----|
+| BB | Weekly | 50, 2.0 | 2 |
+| BB | Daily | 50, 0.7 | 20 |
 
 ```
 emaVal = EMA(close, emaLen)
-basis  = SMA(emaVal, bbLength)      // BB is on EMA, not raw close
-dev    = bbMult * STDEV(emaVal, bbLength)
-upper  = basis + dev
-lower  = basis - dev
-
-BUY  : close > upper AND close > emaVal  (one-shot until exit)
-EXIT : close < lower                     (resets long state)
+BB on EMA series (not raw close)
+BUY  : close > upper AND close > emaVal  (one-shot)
+EXIT : close < lower
 ```
 
-Position state is emulated bar-by-bar (`var bool inLong`) so BUY/EXIT fire once each cycle.
+### RSI (source = EMA 21)
+
+| Mode | Timeframe | RSI | Source | Entry | Exit |
+|------|-----------|-----|--------|-------|------|
+| RSI≥70 | Weekly / Daily | 10 | EMA(close,21) | Fresh cross **above 70** | Cross **above 90** or **below 55** |
+| RSI≥10 | Weekly / Daily | 10 | EMA(close,21) | Fresh cross **above 10** | Cross **below 10** |
+
+All RSI signals are **fresh crosses only** (one-shot position state).
 
 ## Data
 
-Market data from **Yahoo Finance** (`yahoo-finance2`, Node equivalent of Python `yfinance`) with `.NS` symbols.
+Yahoo Finance (`yahoo-finance2`) · `.NS` symbols.
 
 ## Run
 
@@ -36,21 +39,22 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000), pick Weekly or Daily, then **Run Scan**.
+Pick **BB / RSI≥70 / RSI≥10**, then **Weekly / Daily**, then **Run Scan**.
 
 ## API
 
 ```http
 POST /api/analyze
-Content-Type: application/json
-
-{ "symbol": "RELIANCE", "timeframe": "weekly" }
+{ "symbol": "RELIANCE", "strategy": "rsi70", "timeframe": "weekly" }
 ```
 
-`timeframe`: `"weekly"` | `"daily"`
+Or explicit: `{ "symbol": "TCS", "modeId": "rsi10_daily" }`
+
+`strategy`: `bb` | `rsi70` | `rsi10`  
+`timeframe`: `weekly` | `daily`
 
 ```http
 GET /api/analyze
 ```
 
-Returns screener config metadata.
+Returns all screener configs.
