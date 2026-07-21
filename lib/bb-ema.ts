@@ -15,14 +15,23 @@
 
 import YahooFinance from "yahoo-finance2";
 import {
-  SCREENERS,
+  BB_SCREENERS,
+  modeId,
   type Timeframe,
   type Candle,
   type BbEmaResult,
+  type BbScreenerConfig,
+  type ScreenerModeId,
 } from "@/lib/types";
 
-export type { Timeframe, Candle, BbEmaResult, ScreenerConfig } from "@/lib/types";
-export { SCREENERS } from "@/lib/types";
+export type {
+  Timeframe,
+  Candle,
+  BbEmaResult,
+  ScreenerConfig,
+  ScreenerModeId,
+} from "@/lib/types";
+export { SCREENERS, BB_SCREENERS, modeId } from "@/lib/types";
 
 const yahoo = new YahooFinance({
   suppressNotices: ["ripHistorical", "yahooSurvey"],
@@ -213,12 +222,16 @@ function emptyResult(
   symbol: string,
   name: string,
   timeframe: Timeframe,
+  mid: ScreenerModeId,
   error?: string
 ): BbEmaResult {
   return {
+    kind: "bb",
     symbol,
     name,
+    strategy: "bb",
     timeframe,
+    modeId: mid,
     ltp: 0,
     changePct: 0,
     lastClose: 0,
@@ -230,6 +243,9 @@ function emptyResult(
     pctAboveUpper: null,
     pctBelowLower: null,
     pctVsEma: null,
+    rsi: null,
+    prevRsi: null,
+    ema21: null,
     entryCond: false,
     exitCond: false,
     buySignal: false,
@@ -251,7 +267,8 @@ export async function analyzeBbEma(
   timeframe: Timeframe,
   providedName?: string
 ): Promise<BbEmaResult> {
-  const cfg = SCREENERS[timeframe];
+  const cfg = BB_SCREENERS[timeframe] as BbScreenerConfig;
+  const mid = modeId("bb", timeframe);
   const symbol = rawSymbol
     .toUpperCase()
     .trim()
@@ -290,6 +307,7 @@ export async function analyzeBbEma(
         symbol,
         providedName || symbol,
         timeframe,
+        mid,
         `Failed to fetch ${cfg.interval} data`
       );
     }
@@ -313,6 +331,7 @@ export async function analyzeBbEma(
       symbol,
       providedName || symbol,
       timeframe,
+      mid,
       `Need ≥${cfg.minBars} bars, got ${candles.length}`
     );
   }
@@ -417,9 +436,12 @@ export async function analyzeBbEma(
   }
 
   return {
+    kind: "bb",
     symbol,
     name: displayName,
+    strategy: "bb",
     timeframe,
+    modeId: mid,
     ltp: Number(ltp.toFixed(2)),
     changePct: Number(changePct.toFixed(2)),
     lastClose: Number(close.toFixed(2)),
@@ -431,6 +453,9 @@ export async function analyzeBbEma(
     pctAboveUpper,
     pctBelowLower,
     pctVsEma,
+    rsi: null,
+    prevRsi: null,
+    ema21: null,
     entryCond,
     exitCond,
     buySignal,
